@@ -1,4 +1,4 @@
-import { captureLabel, chooseDetection, modelFromJSON, modelToJSON, partitionDataset } from './cnn-core.js';
+import { scanWindows, preprocess, suppressBoxes, evaluatePredictions, isBackgroundClass, captureLabel, chooseDetection, modelFromJSON, modelToJSON, partitionDataset } from './cnn-core.js';
 
 const $ = selector => document.querySelector(selector);
 let classes = ['类别A', '类别B'];
@@ -6,6 +6,7 @@ let selectedClass = 0;
 let data = [];
 let model = null;
 let running = false;
+let trainingActive = false;
 let epoch = 0;
 let lossHistory = [];
 let nextSampleId = 1;
@@ -36,11 +37,12 @@ function render() {
 function addClass(name) {
   const clean = name.trim();
   if (!clean || classes.includes(clean)) return;
+  if (trainingActive) return alert('请暂停并等待当前训练轮结束');
   classes.push(clean); selectedClass = classes.length - 1; model = null; render(); drawNet();
 }
 $('#addc').onclick = () => { addClass($('#cn').value); $('#cn').value = ''; };
 $('#addbg').onclick = () => {
-  const existing = classes.findIndex(name => /^(背景|非目标|background|unknown)/i.test(name.trim()));
+  const existing = classes.findIndex(name => isBackgroundClass(name));
   if (existing >= 0) selectedClass = existing;
   else addClass('背景 / 非目标');
   render();
@@ -56,23 +58,16 @@ $('#files').onchange = event => {
   event.target.value = '';
 };
 
-function imageToX(file, callback) {
+function imageToX(file, callback, onError = () => {}) {
   const objectURL = URL.createObjectURL(file);
   const image = new Image();
   image.onload = () => {
     const canvas = document.createElement('canvas'); canvas.width = canvas.height = N;
     const context = canvas.getContext('2d', { willReadFrequently: true });
-    context.fillStyle = '#000'; context.fillRect(0, 0, N, N);
-    const scale = Math.min(N / image.width, N / image.height);
-    const width = image.width * scale, height = image.height * scale;
-    context.drawImage(image, (N - width) / 2, (N - height) / 2, width, height);
-    const pixels = context.getImageData(0, 0, N, N).data, x = [];
-    for (let i = 0; i < N * N; i++) {
-      x.push(pixels[i * 4] / 255, pixels[i * 4 + 1] / 255, pixels[i * 4 + 2] / 255);
-    }
+    const x = preprocess(context, image);
     URL.revokeObjectURL(objectURL); callback(x, URL.createObjectURL(file));
   };
-  image.onerror = () => { URL.revokeObjectURL(objectURL); $('#info').textContent = '有图片无法读取，请检查文件格式。'; };
+  image.onerror = () => { onError(); URL.revokeObjectURL(objectURL); $('#info').textContent = '有图片无法读取，请检查文件格式。'; };
   image.src = objectURL;
 }
 
@@ -162,15 +157,17 @@ function metrics(samples) {
   return [totalLoss / (samples.length || 1), correct / (samples.length || 1)];
 }
 async function train(epochs) {
-  if (running) return;
+  if (trainingActive) return;
   if (new Set(data.map(sample => sample.y)).size < 2) return alert('至少两个类别需要有图片');
   if (data.length < 10) return alert('样本太少，建议先添加更多图片');
   if (!model || model.K !== classes.length) initModel();
+  const bg = classes.findIndex(isBackgroundClass);
+  if (bg < 0 || !data.some(s => s.y === bg)) return alert('请先添加背景类和不含目标的负样本');
   const snapshot = [...data];
   let split;
   try { split = partitionDataset(snapshot, $('#vp').value); }
   catch (error) { return alert(error.message); }
-  running = true;
+  running = true; trainingActive = true;
   for (let i = 0; i < epochs && running; i++) {
     await trainBatch(split.train); epoch++;
     const trainMetrics = metrics(split.train), validationMetrics = metrics(split.validation);
@@ -180,12 +177,13 @@ async function train(epochs) {
     $('#val').textContent = `${(validationMetrics[1] * 100).toFixed(1)}%`;
     drawChart(); drawNet();
   }
-  running = false;
+  running = false; trainingActive = false;
 }
 $('#train').onclick = () => train(Number($('#epochs').value));
 $('#one').onclick = () => train(1);
 $('#stop').onclick = () => { running = false; };
 $('#reset').onclick = () => {
+  if (trainingActive) return alert('请暂停并等待当前训练轮结束');
   initModel(); epoch = 0; lossHistory = []; $('#ep').textContent = '0';
   $('#loss').textContent = $('#acc').textContent = $('#val').textContent = '—'; drawNet(); drawChart();
 };
@@ -199,38 +197,31 @@ $('#testfile').onchange = event => {
 function rgbPatch(image, x, y, width, height) {
   const canvas = document.createElement('canvas'); canvas.width = canvas.height = N;
   const context = canvas.getContext('2d', { willReadFrequently: true });
-  context.drawImage(image, x, y, width, height, 0, 0, N, N);
-  const pixels = context.getImageData(0, 0, N, N).data, result = [];
-  for (let i = 0; i < N * N; i++) result.push(pixels[i * 4] / 255, pixels[i * 4 + 1] / 255, pixels[i * 4 + 2] / 255);
-  return result;
-}
-function intersectionOverUnion(a, b) {
-  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y), x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
-  const intersection = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  return intersection / (a.w * a.h + b.w * b.h - intersection + 1e-9);
+  return preprocess(context, image, x, y, width, height);
 }
 async function detectAll() {
+  if (trainingActive) return alert('请先等待训练完成');
   if (!model) return alert('先训练模型');
   const image = $('#preview');
   if (image.dataset.ready !== 'true') return alert('先选择组合图片');
   const width = image.naturalWidth, height = image.naturalHeight;
   const threshold = Number($('#thr').value), minMargin = Number($('#margin').value), minBox = Number($('#minbox').value);
-  const candidates = [], sizes = [];
-  for (let size = minBox; size <= Math.min(width, height) * 0.8; size *= 1.45) sizes.push(Math.round(size));
-  for (let scale = 0; scale < sizes.length; scale++) {
-    const size = sizes[scale], step = Math.max(8, Math.round(size * 0.28));
-    for (let y = 0; y + size <= height; y += step) for (let x = 0; x + size <= width; x += step) {
-      const probabilities = forward(rgbPatch(image, x, y, size, size)).probabilities;
-      const choice = chooseDetection(probabilities, classes, threshold, minMargin);
-      if (choice) candidates.push({ x, y, w: size, h: size, k: choice.index, score: choice.score });
+  if (!classes.some(isBackgroundClass)) return alert('此模型没有背景类别，请加入负样本重新训练');
+  if (!Number.isFinite(minBox) || minBox < 16) return alert('最小目标必须至少为16');
+  const candidates = [];
+  let scanned = 0, rejected = 0;
+  const snapshot = model;
+  for (const box of scanWindows(width,height,minBox)) {
+    if (trainingActive || model !== snapshot) return alert('模型发生变化，请重新检测');
+    const choice = chooseDetection(forward(rgbPatch(image,box.x,box.y,box.w,box.h)).probabilities,classes,threshold,minMargin);
+    scanned++;
+    if (choice) candidates.push({...box,k:choice.index,score:choice.score}); else rejected++;
+    if (scanned % 100 === 0) {
+      $('#answer').textContent = `扫描中：${scanned} 个窗口…`;
+      await new Promise(resolve => setTimeout(resolve,0));
     }
-    $('#answer').textContent = `扫描中 ${scale + 1}/${sizes.length}…`;
-    await new Promise(resolve => setTimeout(resolve, 0));
   }
-  candidates.sort((a, b) => b.score - a.score);
-  const kept = [];
-  for (const candidate of candidates) if (!kept.some(other => candidate.k === other.k && intersectionOverUnion(candidate, other) > 0.30)) kept.push(candidate);
-  kept.splice(40);
+  const kept = suppressBoxes(candidates);
   const canvas = $('#detect'), context = canvas.getContext('2d');
   canvas.width = width; canvas.height = height; canvas.style.display = 'block'; canvas.style.height = 'auto';
   context.drawImage(image, 0, 0, width, height); context.lineWidth = Math.max(2, width / 250); context.font = `${Math.max(14, width / 35)}px monospace`;
@@ -243,7 +234,7 @@ async function detectAll() {
     context.fillStyle = '#8ff0cf'; context.fillText(text, box.x + 4, labelY - 3);
   });
   $('#answer').textContent = kept.length ? Object.entries(counts).map(([name, count]) => `${name} ×${count}`).join(' ｜ ') : '未找到可信目标';
-  $('#probs').textContent = `通过置信度与类别差距筛选 ${candidates.length} 个候选框；NMS 后 ${kept.length} 个。建议为“背景 / 非目标”类别上传不含目标的区域图片，扫描器会排除该类。`;
+  $('#probs').textContent = `扫描 ${scanned} 个窗口，拒绝 ${rejected} 个（这是拒识统计，不是误检真值）；通过置信度与类别差距筛选 ${candidates.length} 个候选框；NMS 后 ${kept.length} 个。建议为“背景 / 非目标”类别上传不含目标的区域图片，扫描器会排除该类。`;
 }
 $('#predict').onclick = detectAll;
 
@@ -281,10 +272,57 @@ $('#im').onclick = () => $('#mfile').click();
 $('#mfile').onchange = async event => {
   try {
     const imported = modelFromJSON(await event.target.files[0].text());
+    if (trainingActive) throw new Error('请暂停并等待当前训练轮结束再导入');
+    data.forEach(s => URL.revokeObjectURL(s.url)); data = []; evaluation = [];
     classes = imported.classes; model = imported.M; epoch = imported.epoch; selectedClass = 0; render(); drawNet();
     $('#ep').textContent = epoch;
   } catch (error) { alert(`导入失败：${error.message}`); }
   event.target.value = '';
 };
-$('#clearall').onclick = () => { if (confirm('确定清空全部训练图片？')) { data = []; render(); } };
+$('#clearall').onclick = () => { if (trainingActive) return alert('请暂停并等待当前训练轮结束'); if (confirm('确定清空全部训练图片？')) { data = []; render(); } };
 render(); initModel(); drawNet(); drawChart();
+
+let evaluation = [];
+$('#negative').onclick = () => { $('#addbg').click(); $('#files').click(); };
+$('#evalfiles').onchange = async event => {
+  const label = selectedClass, negativeScene = $('#scene').checked;
+  if (negativeScene && !isBackgroundClass(classes[label])) return alert('纯背景场景必须选择背景类别');
+  const files = [...event.target.files]; event.target.value = '';
+  await Promise.all(files.map(file => new Promise(resolve => imageToX(file, (x,url) => {
+    evaluation.push({x,url,y:label,scene:negativeScene}); resolve();
+  }, resolve))));
+  $('#evalresult').textContent = `独立测试集：${evaluation.length} 张；不参与训练。`;
+};
+$('#evalclear').onclick = () => { evaluation.forEach(s => URL.revokeObjectURL(s.url)); evaluation = []; $('#evalresult').textContent = '独立测试集已清空'; };
+$('#evaluate').onclick = async () => {
+  if (trainingActive) return alert('请暂停并等待当前训练轮结束');
+  if (!evaluation.length || !model) return alert('先添加独立测试图片');
+  if (!Number.isFinite(Number($('#minbox').value)) || Number($('#minbox').value) < 16) return alert('最小目标必须至少为16');
+  const snapshot = model, names = [...classes], threshold = Number($('#thr').value), margin = Number($('#margin').value);
+  const result = evaluatePredictions(evaluation.map(s => ({y:s.y,probabilities:forward(s.x).probabilities})), names, threshold, margin);
+  const target = $('#evalresult'); target.replaceChildren();
+  const summary = document.createElement('p');
+  summary.textContent = `独立样本 ${result.total}，正确 ${result.correct}，拒识 ${result.rejected}；背景图块误检 ${result.falsePositives}/${result.backgroundTotal}。背景拒识计为正确，目标拒识计为错误。`;
+  target.append(summary);
+  const table = document.createElement('table');
+  for (const row of [['真值 / 预测',...names,'拒识'], ...result.matrix.map((row,i) => [names[i],...row])]) {
+    const tr = document.createElement('tr'); row.forEach(value => { const td = document.createElement('td'); td.textContent = value; td.style.padding = '6px'; tr.append(td); }); table.append(tr);
+  }
+  target.append(table);
+  let scenes = 0, falseBoxes = 0, scenesWithFalseBoxes = 0;
+  for (const sample of evaluation.filter(s => s.scene)) {
+    const image = new Image(); image.src = sample.url; await image.decode();
+    if (model !== snapshot || names.join() !== classes.join()) return alert('模型已变化，请重新评估');
+    const boxes = [], width = image.naturalWidth, height = image.naturalHeight;
+    let scanned = 0;
+    for (const box of scanWindows(width,height,Number($('#minbox').value))) {
+      if (trainingActive || model !== snapshot) return alert('模型已变化，请重新评估');
+      const choice = chooseDetection(forward(rgbPatch(image,box.x,box.y,box.w,box.h)).probabilities,names,threshold,margin);
+      if (choice) boxes.push({...box,k:choice.index,score:choice.score});
+      if (++scanned % 100 === 0) await new Promise(resolve => setTimeout(resolve,0));
+    }
+    const count = suppressBoxes(boxes).length; scenes++; falseBoxes += count; if (count) scenesWithFalseBoxes++;
+  }
+  const sceneStats = document.createElement('p'); sceneStats.textContent = `纯背景组合图：${scenes} 张，误检框 ${falseBoxes} 个，出现误检的图片 ${scenesWithFalseBoxes} 张。仅勾选且确实不含目标的场景有效；尚不评估含目标场景的定位召回率。`; target.append(sceneStats);
+  downloadJSON({classes:names,threshold,margin,minBox:Number($('#minbox').value),...result,scenes,falseBoxes,scenesWithFalseBoxes},'cnn-evaluation.json');
+};

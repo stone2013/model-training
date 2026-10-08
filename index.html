@@ -10,7 +10,7 @@ button{cursor:pointer}.go{border-color:#399478;color:#8df0cf}.bad{color:#ff8b9a}
 </style></head><body><div class=app><h1>CNN LAB · 自定义图片分类器</h1><div class=sub>单目标样本训练 CNN → 一张组合图中扫描多个目标 → 框选、分类、计数</div>
 <div class=grid><aside>
 <div class=p><h2>01 / 类别与训练图片</h2><div class=row><input id=cn placeholder="新类别名" style="flex:1"><button id=addc>＋类别</button><button id=addbg>＋背景 / 非目标类</button></div><div id=classes class=classes></div>
-<div class=row><button id=upload class=go>＋ 给当前类别添加图片</button><input id=files type=file accept="image/*" multiple hidden></div><div id=info class=note></div><div id=thumbs class=thumbs></div></div>
+<div class=row><button id=upload class=go>＋ 给当前类别添加图片</button><input id=files type=file accept="image/*" multiple hidden></div><button id=negative>＋困难负样本：桌面 / 墙壁 / 空白</button><div id=info class=note></div><div id=thumbs class=thumbs></div></div>
 <div class=p><h2>03 / 组合图片多目标识别</h2><img id=preview alt="测试图片预览"><div class=row><button id=testup>选择测试图片</button><input id=testfile type=file accept="image/*" hidden><button id=predict class=go>扫描并识别全部目标</button></div><div class=row><label>置信度 <input id=thr type=number value=.70 min=.1 max=.99 step=.05 style="width:75px"></label><label>最小类别差距 <input id=margin type=number value=.15 min=0 max=.8 step=.05 style="width:75px"></label><label>最小目标 <input id=minbox type=number value=36 min=16 max=200 style="width:75px"></label></div>
 <div id=answer style="font-size:20px;color:#62e6bd">等待组合图片…</div><canvas id=detect width=500 height=500 style="display:none"></canvas><div id=probs></div></div>
 </aside><main><div class=p><h2>02 / CNN 训练</h2>
@@ -19,5 +19,5 @@ button{cursor:pointer}.go{border-color:#399478;color:#8df0cf}.bad{color:#ff8b9a}
 <div class=row><button id=train class=go>▶ 开始训练</button><button id=one>训练 1 轮</button><button id=stop>暂停</button><button id=reset class=bad>重置模型</button></div>
 <canvas id=net width=850 height=300></canvas><canvas id=chart width=850 height=150></canvas>
 <div class=row><button id=em>导出模型</button><button id=im>导入模型</button><input id=mfile type=file accept=".json" hidden><button id=clearall class=bad>清空数据集</button></div>
-<p class=note>网络结构：16×16 RGB 输入 → 4 个 3×3 卷积核 + ReLU → 2×2 MaxPool → 全连接 → Softmax。训练全在浏览器本地执行，不调用服务器。验证集按图片 ID 和固定种子划分，重复训练时样本不漂移。组合图检测会排除“背景 / 非目标”类，并用置信度和类别差距拒绝不确定区域；建议为背景类添加不含目标的图块。每类建议至少 20–50 张不同图片。</p></div></main></div></div>
+<p class=note>网络结构：16×16 RGB 输入 → 4 个 3×3 卷积核 + ReLU → 2×2 MaxPool → 全连接 → Softmax。训练全在浏览器本地执行，不调用服务器。验证集按图片 ID 和固定种子划分，重复训练时样本不漂移。组合图检测会排除“背景 / 非目标”类，并用置信度和类别差距拒绝不确定区域；建议为背景类添加不含目标的图块。每类建议至少 20–50 张不同图片。</p></div><div class=p><h2>04 / 独立测试与背景误检</h2><p class=note>选择左侧真值类别，再添加该类别的独立图片。不要重复使用训练图片。测试集不参与训练；阈值采用检测区设置。纯背景场景不能包含土豆等任何目标。</p><div class=row><input id=evalfiles type=file accept="image/*" multiple><label><input id=scene type=checkbox>整张为纯背景场景（额外滑窗评估）</label><button id=evaluate>评估并导出报告</button><button id=evalclear>清空测试集</button></div><div id=evalresult style="overflow:auto">尚无独立测试样本</div></div></main></div></div>
 <script type="module" src="./app.js"></script></body></html>
